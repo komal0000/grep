@@ -120,7 +120,7 @@ pub struct Config<'a> {
     pub has_context: bool,
 
     // Matcher
-    pub patterns: &'a [&'a str],
+    pub patterns: &'a [&'a [u8]],
     pub regex_mode: RegexMode,
     pub ignore_case: bool,
     pub invert_match: bool,
@@ -155,18 +155,23 @@ fn read_error(label: impl std::fmt::Display, err: &std::io::Error) -> Box<dyn UE
 
 /// Read a file named by `-f` or `--exclude-from`, where `-` means standard
 /// input. An unreadable file is mapped to the usage error here so both callers
-/// can simply use `?`.
-fn read_pattern_file(path: &str) -> UResult<String> {
+/// can simply use `?`. With `require_utf8`, contents that are not UTF-8 are an
+/// error too.
+fn read_pattern_file(path: &str, require_utf8: bool) -> UResult<Vec<u8>> {
     let (label, contents) = if path == "-" {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         (
             "(standard input)",
-            std::io::stdin().read_to_string(&mut buf).map(|_| buf),
+            std::io::stdin().read_to_end(&mut buf).map(|_| buf),
         )
     } else {
-        (path, std::fs::read_to_string(path))
+        (path, std::fs::read(path))
     };
-    contents.map_err(|err| read_error(label, &err))
+    let contents = contents.map_err(|err| read_error(label, &err))?;
+    if require_utf8 {
+        std::io::read_to_string(&contents[..]).map_err(|err| read_error(label, &err))?;
+    }
+    Ok(contents)
 }
 
 #[uucore::main(no_signals)]
@@ -270,17 +275,18 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     {
         for expr in regexp {
             for line in expr.split('\n') {
-                patterns.push(line);
+                patterns.push(line.as_bytes());
             }
         }
 
         for path in file_pattern {
-            pattern_strings.push(read_pattern_file(path)?);
+            // Only fixed strings can be matched as raw bytes.
+            pattern_strings.push(read_pattern_file(path, !fixed_strings)?);
         }
         for contents in &pattern_strings {
             if !contents.is_empty() {
-                let body = contents.strip_suffix('\n').unwrap_or(contents);
-                for line in body.split('\n') {
+                let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+                for line in body.split(|&b| b == b'\n') {
                     patterns.push(line);
                 }
             }
@@ -291,7 +297,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 .to_str()
                 .ok_or_else(|| USimpleError::new(2, "pattern must be valid UTF-8".to_string()))?;
             for line in pat.split('\n') {
-                patterns.push(line);
+                patterns.push(line.as_bytes());
             }
         }
     }
@@ -372,8 +378,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         matches.indices_of("exclude_from"),
     ) {
         for (i, path) in indices.zip(paths) {
-            let contents = read_pattern_file(path)?;
-            for line in contents.lines() {
+            let contents = read_pattern_file(path, true)?;
+            for line in String::from_utf8_lossy(&contents).lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     globs.push((i, false, trimmed.to_string()));
