@@ -7,7 +7,8 @@ use crate::{Config, RegexMode};
 use memchr::memmem;
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
 use onig_sys::{
-    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
+    ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingASCII,
+    OnigEncodingUTF8,
 };
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
@@ -241,15 +242,15 @@ impl Cursor<'_> {
 /// are not valid UTF-8: an ASCII byte can never be part of a multi-byte sequence,
 /// so its presence is unambiguous. In the regex modes we also require that no
 /// byte could ever act as a metacharacter; under `-F` the text is literal as-is.
-fn plain_literal(pattern: &str, ignore_case: bool, mode: RegexMode) -> Option<Vec<u8>> {
+fn plain_literal(pattern: &[u8], ignore_case: bool, mode: RegexMode) -> Option<Vec<u8>> {
     if ignore_case || pattern.is_empty() || !pattern.is_ascii() {
         return None;
     }
     // Every byte that carries special meaning in any of our regex syntaxes.
     // A needle without these reads the same as a literal in Basic/Extended/Perl.
     const SPECIAL: &[u8] = b".*[]^$\\+?{}()|";
-    let plain = mode == RegexMode::Fixed || !pattern.bytes().any(|b| SPECIAL.contains(&b));
-    plain.then(|| pattern.as_bytes().to_vec())
+    let plain = mode == RegexMode::Fixed || !pattern.iter().any(|b| SPECIAL.contains(b));
+    plain.then(|| pattern.to_vec())
 }
 
 struct CompiledPattern {
@@ -262,7 +263,7 @@ struct CompiledPattern {
 }
 
 impl CompiledPattern {
-    fn compile(pattern: &str, config: &Config) -> UResult<Self> {
+    fn compile(pattern: &[u8], config: &Config) -> UResult<Self> {
         let mut syntax = *match config.regex_mode {
             RegexMode::Fixed => Syntax::asis(),
             RegexMode::Basic => Syntax::grep(),
@@ -279,7 +280,7 @@ impl CompiledPattern {
         }
 
         if matches!(config.regex_mode, RegexMode::Basic | RegexMode::Extended)
-            && has_confusing_bracket(pattern.as_bytes())
+            && has_confusing_bracket(pattern)
         {
             return Err(USimpleError::new(
                 2,
@@ -291,7 +292,7 @@ impl CompiledPattern {
         let pattern = if config.regex_mode == RegexMode::Extended {
             if let Some((op, rest)) = strip_leading_repeat_operator(pattern) {
                 show_warning!("{op} at start of expression");
-                normalized_pattern = Some(rest.to_string());
+                normalized_pattern = Some(rest.to_vec());
             }
             normalized_pattern.as_deref().unwrap_or(pattern)
         } else {
@@ -322,7 +323,7 @@ impl CompiledPattern {
         }
 
         fn compile_with(
-            pattern: &str,
+            pattern: &[u8],
             syntax: &Syntax,
             options: RegexOptions,
         ) -> UResult<OnigRegex> {
@@ -332,7 +333,11 @@ impl CompiledPattern {
                 // echoed), so translate this code to match its diagnostic.
                 let message = match err.code {
                     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS => "Invalid range end".to_string(),
-                    _ => format!("invalid pattern \"{pattern}\": {}", err.message),
+                    _ => format!(
+                        "invalid pattern \"{}\": {}",
+                        String::from_utf8_lossy(pattern),
+                        err.message
+                    ),
                 };
                 USimpleError::new(2, message)
             })
@@ -384,8 +389,7 @@ unsafe impl Send for OnigRegex {}
 unsafe impl Sync for OnigRegex {}
 
 impl OnigRegex {
-    fn compile(pattern: &str, syntax: &Syntax, options: RegexOptions) -> Result<Self, OnigError> {
-        let pattern = pattern.as_bytes();
+    fn compile(pattern: &[u8], syntax: &Syntax, options: RegexOptions) -> Result<Self, OnigError> {
         let mut raw = null_mut();
         let mut error = onig_sys::OnigErrorInfo {
             enc: null_mut(),
@@ -398,10 +402,16 @@ impl OnigRegex {
             case_fold_flag &= !onig_sys::INTERNAL_ONIGENC_CASE_FOLD_MULTI_CHAR;
         }
 
+        // Oniguruma rejects invalid UTF-8 in a UTF-8 pattern, so match those bytewise.
+        let encoding = if std::str::from_utf8(pattern).is_ok() {
+            &raw mut OnigEncodingUTF8
+        } else {
+            &raw mut OnigEncodingASCII
+        };
         let mut compile_info = onig_sys::OnigCompileInfo {
             num_of_elements: 5,
-            pattern_enc: &raw mut OnigEncodingUTF8,
-            target_enc: &raw mut OnigEncodingUTF8,
+            pattern_enc: encoding,
+            target_enc: encoding,
             syntax: syntax as *const Syntax as *mut Syntax as *mut onig_sys::OnigSyntaxType,
             option: options.bits(),
             case_fold_flag,
@@ -410,7 +420,7 @@ impl OnigRegex {
         let _guard = ONIG_NEW_MUTEX.lock().unwrap();
         // SAFETY: `pattern` supplies a valid start/end pointer pair for the
         // duration of the call, and `compile_info` uses Oniguruma's built-in
-        // UTF-8 encoding plus a syntax value borrowed from the safe wrapper.
+        // encodings plus a syntax value borrowed from the safe wrapper.
         let result = unsafe {
             onig_sys::onig_new_deluxe(
                 &mut raw,
@@ -515,8 +525,8 @@ fn onig_error_message(code: i32, info: *const onig_sys::OnigErrorInfo) -> String
     String::from_utf8_lossy(&buff[..len as usize]).into_owned()
 }
 
-fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> {
-    match pattern.as_bytes().first()? {
+fn strip_leading_repeat_operator(pattern: &[u8]) -> Option<(&'static str, &[u8])> {
+    match pattern.first()? {
         b'?' => Some(("?", &pattern[1..])),
         b'*' => Some(("*", &pattern[1..])),
         b'+' => Some(("+", &pattern[1..])),
@@ -525,12 +535,12 @@ fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> 
     }
 }
 
-fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
-    let close = pattern.as_bytes().iter().position(|&b| b == b'}')?;
+fn strip_leading_interval_repeat(pattern: &[u8]) -> Option<&[u8]> {
+    let close = pattern.iter().position(|&b| b == b'}')?;
     let body = &pattern[1..close];
     let is_interval = !body.is_empty()
-        && body.bytes().all(|b| b.is_ascii_digit() || b == b',')
-        && body.bytes().any(|b| b.is_ascii_digit());
+        && body.iter().all(|b| b.is_ascii_digit() || *b == b',')
+        && body.iter().any(|b| b.is_ascii_digit());
     is_interval.then_some(&pattern[close + 1..])
 }
 
@@ -622,7 +632,7 @@ mod tests {
     use crate::RegexMode;
 
     fn lit(p: &str, ic: bool, mode: RegexMode) -> Option<Vec<u8>> {
-        plain_literal(p, ic, mode)
+        plain_literal(p.as_bytes(), ic, mode)
     }
 
     #[test]

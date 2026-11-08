@@ -104,7 +104,7 @@ pub struct Config<'a> {
     pub has_context: bool,
 
     // Matcher
-    pub patterns: &'a [&'a str],
+    pub patterns: &'a [&'a [u8]],
     pub regex_mode: RegexMode,
     pub ignore_case: bool,
     pub invert_match: bool,
@@ -236,26 +236,29 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     {
         for expr in regexp {
             for line in expr.split('\n') {
-                patterns.push(line);
+                patterns.push(line.as_bytes());
             }
         }
 
         for path in file_pattern {
-            let contents = if *path == "-" {
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|err| read_error("(standard input)", &err))?;
-                buf
+            let (name, contents) = if *path == "-" {
+                let mut buf = Vec::new();
+                let read = std::io::stdin().read_to_end(&mut buf).map(|_| buf);
+                ("(standard input)", read)
             } else {
-                std::fs::read_to_string(path).map_err(|err| read_error(path, &err))?
+                (path.as_str(), std::fs::read(path))
             };
+            let contents = contents.map_err(|err| read_error(name, &err))?;
+            // Only fixed strings can be matched as raw bytes.
+            if !fixed_strings {
+                std::io::read_to_string(&contents[..]).map_err(|err| read_error(name, &err))?;
+            }
             pattern_strings.push(contents);
         }
         for contents in &pattern_strings {
             if !contents.is_empty() {
-                let body = contents.strip_suffix('\n').unwrap_or(contents);
-                for line in body.split('\n') {
+                let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+                for line in body.split(|&b| b == b'\n') {
                     patterns.push(line);
                 }
             }
@@ -266,7 +269,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 .to_str()
                 .ok_or_else(|| USimpleError::new(2, "pattern must be valid UTF-8".to_string()))?;
             for line in pat.split('\n') {
-                patterns.push(line);
+                patterns.push(line.as_bytes());
             }
         }
     }

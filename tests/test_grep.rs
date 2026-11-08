@@ -1473,6 +1473,17 @@ fn invalid_utf8_on_nonmatching_line_does_not_poison_file() {
 }
 
 #[test]
+fn fixed_pattern_file_matches_invalid_utf8_bytes() {
+    let (scene, mut c) = ucmd();
+    scene.fixtures.write_bytes("pats", b"\xff\nok\n");
+    scene.fixtures.write_bytes("input", b"\xff\nok\nno\n");
+    c.args(&["-aF", "-f", "pats", "input"])
+        .succeeds()
+        .stdout_is_bytes(b"\xff\nok\n")
+        .no_stderr();
+}
+
+#[test]
 fn binary_files_text_forces_text_mode() {
     let (scene, _) = ucmd();
     scene.fixtures.write_bytes("b", b"hit\0more\n");
