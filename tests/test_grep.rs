@@ -754,6 +754,19 @@ fn no_pattern_is_usage_error() {
 }
 
 #[test]
+fn usage_errors_exit_2() {
+    for (args, message) in [
+        (&["-e"][..], "a value is required"),
+        (&["-A"], "a value is required"),
+        (&["--binary-files=foo", "x"], "invalid value"),
+        (&["--unknown-option", "x"], "unexpected argument"),
+    ] {
+        let (_s, mut c) = ucmd();
+        c.args(args).fails_with_code(2).stderr_contains(message);
+    }
+}
+
+#[test]
 fn count_modes() {
     // Count for single stdin.
     let (_s, mut c) = ucmd();

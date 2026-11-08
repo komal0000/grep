@@ -140,7 +140,9 @@ fn read_error(label: impl std::fmt::Display, err: &std::io::Error) -> Box<dyn UE
 #[uucore::main(no_signals)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let args = expand_num_shorthand(args);
-    let matches = uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 2)?;
+    // uucore forces status 1 for clap's InvalidValue, but 1 means "no match" in grep.
+    let matches = uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 2)
+        .map_err(|e| if e.code() == 1 { ExitCode::new(2) } else { e })?;
 
     // GNU grep ignores a malformed legacy match color without a warning.
     let grep_color = std::env::var("GREP_COLOR")
